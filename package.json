@@ -1,6 +1,7 @@
 {
   "dependencies": {
-    "@google/generative-ai": "^0.24.1"
+    "@google/generative-ai": "^0.24.1",
+    "firebase-admin": "^11.11.0"
   },
   "name": "translator-api",
   "version": "1.0.0",
