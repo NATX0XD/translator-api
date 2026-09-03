@@ -1,2 +1,18 @@
-.vercel
+# dependencies
+node_modules/
+
+# secrets & deploy state
 .env
+.env.local
+.env.*.local
+.vercel
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# misc
+.DS_Store
+coverage/
