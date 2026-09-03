@@ -45,6 +45,12 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: "Unauthorized", message: "Invalid or expired ID token" });
   }
 
+  // Destructuring a missing body here would throw outside the try below and
+  // surface as an opaque 500 instead of a request error.
+  if (!req.body || typeof req.body !== 'object') {
+    return res.status(400).json({ error: "Invalid Request", message: "Expected a JSON body with { seconds }." });
+  }
+
   const { seconds } = req.body;
 
   try {

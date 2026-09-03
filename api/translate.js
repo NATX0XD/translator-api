@@ -2,6 +2,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import admin from "firebase-admin";
 import { buildSystemInstruction } from "../lib/prompt.js";
 import { buildResetUpdate, needsReset, normalizeQuota, todayString } from "../lib/liveQuota.js";
+import { buildResponseSchema } from "../lib/responseSchema.js";
 import { validateTranslateRequest } from "../lib/validation.js";
 
 
@@ -51,27 +52,36 @@ export default async function handler(req, res) {
 
 
     const quotaRef = db.collection("users_quota").doc(uid);
-    const quotaSnap = await quotaRef.get();
-
-
     const todayStr = todayString(new Date());
 
     // One reset rule for both buckets (lib/liveQuota.js). Resetting only
     // tokens_today here would consume last_reset_date and leave the Live bucket
     // permanently full, 429-ing /api/live-token for the rest of the user's life.
-    const quotaData = normalizeQuota(quotaSnap.exists ? quotaSnap.data() : null, todayStr);
+    //
+    // The reset writes absolute zeroes, so it has to read and write inside one
+    // transaction: on a stale read at the day boundary it would otherwise wipe a
+    // live charge that /api/live-usage had just committed. The set merges for the
+    // same reason — a doc created by /api/live-token in the meantime keeps its
+    // live_session.
+    const quotaData = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(quotaRef);
+      const data = snap.exists ? snap.data() : null;
+      const normalized = normalizeQuota(data, todayStr);
 
-    if (!quotaSnap.exists) {
-      await quotaRef.set({
-        tokens_today: quotaData.tokens_today,
-        daily_limit: quotaData.daily_limit,
-        live_seconds_today: quotaData.live_seconds_today,
-        live_seconds_limit: quotaData.live_seconds_limit,
-        last_reset_date: todayStr,
-      });
-    } else if (needsReset(quotaSnap.data(), todayStr)) {
-      await quotaRef.update(buildResetUpdate(todayStr));
-    }
+      if (!snap.exists) {
+        tx.set(quotaRef, {
+          tokens_today: normalized.tokens_today,
+          daily_limit: normalized.daily_limit,
+          live_seconds_today: normalized.live_seconds_today,
+          live_seconds_limit: normalized.live_seconds_limit,
+          last_reset_date: todayStr,
+        }, { merge: true });
+      } else if (needsReset(data, todayStr)) {
+        tx.update(quotaRef, buildResetUpdate(todayStr));
+      }
+
+      return normalized;
+    });
 
 
     if (quotaData.tokens_today >= quotaData.daily_limit) {
@@ -93,24 +103,7 @@ export default async function handler(req, res) {
     const generationConfig = {
       response_mime_type: "application/json",
       temperature: 0.1,
-      response_schema: {
-        type: "object",
-        properties: {
-          detected: { type: "string" },
-          translations: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                lang: { type: "string" },
-                text: { type: "string" }
-              },
-              required: ["lang", "text"]
-            }
-          }
-        },
-        required: ["detected", "translations"]
-      }
+      response_schema: buildResponseSchema(twoWay)
     };
 
     const userPrompt = JSON.stringify({ src: sourceText, targets });
