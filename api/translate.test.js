@@ -151,6 +151,32 @@ test('the one-way schema stays unbounded', async () => {
   assert.equal('maxItems' in translations, false);
 });
 
+// --- S2: a missing body is a request error, not a crash ---------------------
+
+test('a request with no body is a 400, not an unhandled crash', async () => {
+  const store = useStore({});
+  const calls = stubGemini();
+
+  const res = makeRes();
+  await handler({ method: 'POST', headers: {} }, res);
+
+  assert.equal(res.statusCode, 400, 'destructuring req.body above the try turns this into an opaque 500');
+  assert.equal(store.touched, 0);
+  assert.equal(calls.length, 0);
+});
+
+test('a non-object body is refused the same way', async () => {
+  const store = useStore({});
+
+  for (const body of ['', 'not json', null]) {
+    const res = makeRes();
+    await handler({ method: 'POST', headers: {}, body }, res);
+    assert.equal(res.statusCode, 400, `expected 400 for body ${JSON.stringify(body)}`);
+  }
+
+  assert.equal(store.touched, 0);
+});
+
 test('twoWay with the wrong target count is refused before Firestore or the model', async () => {
   const store = useStore({ 'users_quota/user-1': { tokens_today: 0, daily_limit: 10000, last_reset_date: TODAY() } });
   const calls = stubGemini();

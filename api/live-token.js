@@ -120,8 +120,13 @@ export default async function handler(req, res) {
 
     // Written only after the mint succeeds: a failure above leaves no session
     // behind to be billed as abandoned.
+    //
+    // `confirmed: false` until the client posts /api/live-confirm once its socket
+    // is open. A session that never gets confirmed is discarded unbilled at the
+    // next mint, so a lost response or a denied microphone cannot cost the user
+    // the rest of their daily allowance.
     await quotaRef.set({
-      live_session: { mintedAt, ttlSeconds: TOKEN_TTL_SECONDS },
+      live_session: { mintedAt, ttlSeconds: TOKEN_TTL_SECONDS, confirmed: false },
     }, { merge: true });
 
     return res.status(200).json({

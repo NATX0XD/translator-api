@@ -102,7 +102,7 @@ test('a session left behind by a crashed tab is billed at the next mint', async 
       live_seconds_today: 100,
       live_seconds_limit: 600,
       last_reset_date: TODAY(),
-      live_session: { mintedAt: Date.now() - 120_000, ttlSeconds: 600 },
+      live_session: { mintedAt: Date.now() - 120_000, ttlSeconds: 600, confirmed: true },
     },
   });
   stubTokenMint();
@@ -114,6 +114,60 @@ test('a session left behind by a crashed tab is billed at the next mint', async 
   const doc = store.raw('users_quota/user-1');
   assert.equal(doc.live_seconds_today, 220, '100 already used plus the 120s the abandoned session could have run');
   assert.equal(doc.tokens_today, 2000, 'the mint must not touch the text bucket');
+});
+
+test('an UNCONFIRMED stale session bills nothing and does not 429 the user', async () => {
+  const store = useStore({
+    'users_quota/user-1': {
+      live_seconds_today: 100,
+      live_seconds_limit: 600,
+      last_reset_date: TODAY(),
+      // Minted, then the response was lost or the socket never opened.
+      live_session: { mintedAt: Date.now() - 600_000, ttlSeconds: 600, confirmed: false },
+    },
+  });
+  stubTokenMint();
+  acceptToken('user-1');
+
+  const res = await run({ headers: bearer });
+
+  assert.equal(res.statusCode, 200, 'a stranded mint must not lock the user out for the day');
+  assert.equal(res.body.remainingSeconds, 500);
+  assert.equal(
+    store.raw('users_quota/user-1').live_seconds_today,
+    100,
+    'zero audio was produced, so nothing may be billed'
+  );
+});
+
+test('a fresh mint records the session as unconfirmed', async () => {
+  const store = useStore({
+    'users_quota/user-1': { live_seconds_today: 0, live_seconds_limit: 600, last_reset_date: TODAY() },
+  });
+  stubTokenMint();
+  acceptToken('user-1');
+
+  await run({ headers: bearer });
+
+  assert.equal(
+    store.raw('users_quota/user-1').live_session.confirmed,
+    false,
+    'until /api/live-confirm lands, the session cannot be billed as abandoned'
+  );
+});
+
+test('a zeroed live limit is a suspension, not a licence to mint', async () => {
+  const store = useStore({
+    'users_quota/susp': { live_seconds_today: 0, live_seconds_limit: 0, last_reset_date: TODAY() },
+  });
+  const mints = stubTokenMint();
+  acceptToken('susp');
+
+  const res = await run({ headers: bearer });
+
+  assert.equal(res.statusCode, 429, 'live_seconds_limit: 0 must refuse, not fall back to 600');
+  assert.equal(mints.length, 0, 'a suspended account must never be handed a Gemini credential');
+  assert.equal(store.raw('users_quota/susp').live_session, undefined);
 });
 
 test('a failed mint leaves no session behind to be billed later', async () => {

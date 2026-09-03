@@ -32,6 +32,15 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ message: 'Use POST' });
 
+  // Destructuring a missing body here would throw outside the try below and
+  // surface as an opaque 500 instead of a request error.
+  if (!req.body || typeof req.body !== 'object') {
+    return res.status(400).json({
+      error: "Invalid Request",
+      message: "Expected a JSON body with { uid, sourceText, targets }.",
+    });
+  }
+
   const { sourceText, targets, uid, twoWay } = req.body;
 
   if (!uid) {
