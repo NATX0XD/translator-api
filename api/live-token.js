@@ -1,5 +1,8 @@
 import admin from "firebase-admin";
-import { normalizeQuota, todayString } from "../lib/liveQuota.js";
+import { extractBearerToken } from "../lib/auth.js";
+import { todayString } from "../lib/liveQuota.js";
+import { planTokenMint, isEmptyPlan } from "../lib/quotaStore.js";
+import { planToUpdate } from "../lib/firestorePlan.js";
 
 const TOKEN_TTL_SECONDS = 600;
 const SESSION_START_WINDOW_SECONDS = 60;
@@ -24,30 +27,68 @@ const db = admin.firestore();
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ message: 'Use POST' });
 
-  const { uid } = req.body;
-  if (!uid) return res.status(400).json({ error: "Unauthorized: Missing User ID" });
+  // The uid comes from the verified ID token only. A body uid would let anyone
+  // who finds this URL mint Gemini credentials against an arbitrary account.
+  const idToken = extractBearerToken(req);
+  if (!idToken) {
+    return res.status(401).json({
+      error: "Unauthorized",
+      message: "Missing Authorization: Bearer <Firebase ID token>",
+    });
+  }
+
+  let uid;
+  try {
+    ({ uid } = await admin.auth().verifyIdToken(idToken));
+  } catch (error) {
+    console.error("live-token auth error:", error.message);
+    return res.status(401).json({ error: "Unauthorized", message: "Invalid or expired ID token" });
+  }
 
   try {
     const quotaRef = db.collection("users_quota").doc(uid);
-    const quotaSnap = await quotaRef.get();
     const todayStr = todayString(new Date());
-    const quota = normalizeQuota(quotaSnap.exists ? quotaSnap.data() : null, todayStr);
+    const now = Date.now();
 
-    const remainingSeconds = quota.live_seconds_limit - quota.live_seconds_today;
-    if (remainingSeconds <= 0) {
+    // Reset, abandoned-session billing, and the quota check all read the same
+    // snapshot, so a concurrent /api/translate increment cannot be lost between
+    // the read and the write.
+    const outcome = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(quotaRef);
+      const result = planTokenMint({
+        data: snap.exists ? snap.data() : null,
+        todayStr,
+        nowMs: now,
+      });
+
+      if (!snap.exists) {
+        tx.set(quotaRef, planToUpdate(result.plan), { merge: true });
+      } else if (!isEmptyPlan(result.plan)) {
+        tx.update(quotaRef, planToUpdate(result.plan));
+      }
+
+      return result;
+    });
+
+    if (outcome.abandonedSeconds > 0) {
+      console.warn(`live-token: billed ${outcome.abandonedSeconds}s for an abandoned session (uid ${uid})`);
+    }
+
+    if (outcome.remainingSeconds <= 0) {
       return res.status(429).json({
         error: "Live Quota Exceeded",
-        message: `You have used your daily live translation allowance (${quota.live_seconds_limit} seconds). Please come back tomorrow.`,
+        message: `You have used your daily live translation allowance (${outcome.liveSecondsLimit} seconds). Please come back tomorrow.`,
         remainingSeconds: 0,
       });
     }
 
-    const now = Date.now();
+    // uses: 1 is correct — a dropped socket falls back to Web Speech rather than
+    // reconnecting, so the token is only ever spent on one new session.
     const tokenResponse = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/auth_tokens",
       {
@@ -75,20 +116,18 @@ export default async function handler(req, res) {
     }
 
     const tokenData = await tokenResponse.json();
+    const mintedAt = Date.now();
 
+    // Written only after the mint succeeds: a failure above leaves no session
+    // behind to be billed as abandoned.
     await quotaRef.set({
-      tokens_today: quota.tokens_today,
-      daily_limit: quota.daily_limit,
-      live_seconds_today: quota.live_seconds_today,
-      live_seconds_limit: quota.live_seconds_limit,
-      last_reset_date: quota.last_reset_date,
-      live_session: { mintedAt: now, ttlSeconds: TOKEN_TTL_SECONDS },
+      live_session: { mintedAt, ttlSeconds: TOKEN_TTL_SECONDS },
     }, { merge: true });
 
     return res.status(200).json({
       token: tokenData.name,
-      expiresAt: now + TOKEN_TTL_SECONDS * 1000,
-      remainingSeconds: Math.min(remainingSeconds, TOKEN_TTL_SECONDS),
+      expiresAt: mintedAt + TOKEN_TTL_SECONDS * 1000,
+      remainingSeconds: Math.min(outcome.remainingSeconds, TOKEN_TTL_SECONDS),
     });
   } catch (error) {
     console.error("live-token Error:", error.message);

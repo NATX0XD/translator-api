@@ -1,6 +1,8 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import admin from "firebase-admin";
 import { buildSystemInstruction } from "../lib/prompt.js";
+import { buildResetUpdate, needsReset, normalizeQuota, todayString } from "../lib/liveQuota.js";
+import { validateTranslateRequest } from "../lib/validation.js";
 
 
 if (!admin.apps.length) {
@@ -35,6 +37,15 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Unauthorized: Missing User ID" });
   }
 
+  // TODO: this endpoint still trusts a body uid. Verifying an Authorization
+  // bearer token here the way /api/live-token and /api/live-usage now do is
+  // tracked separately.
+
+  const validation = validateTranslateRequest({ twoWay, targets });
+  if (!validation.ok) {
+    return res.status(400).json({ error: validation.error, message: validation.message });
+  }
+
   try {
 
 
@@ -43,32 +54,23 @@ export default async function handler(req, res) {
     const quotaSnap = await quotaRef.get();
 
 
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = todayString(new Date());
 
-    let quotaData;
+    // One reset rule for both buckets (lib/liveQuota.js). Resetting only
+    // tokens_today here would consume last_reset_date and leave the Live bucket
+    // permanently full, 429-ing /api/live-token for the rest of the user's life.
+    const quotaData = normalizeQuota(quotaSnap.exists ? quotaSnap.data() : null, todayStr);
 
     if (!quotaSnap.exists) {
-
-      quotaData = {
-        tokens_today: 0,
-        daily_limit: 10000,
-        last_reset_date: todayStr
-      };
-      await quotaRef.set(quotaData);
-    } else {
-      quotaData = quotaSnap.data();
-
-
-      if (quotaData.last_reset_date !== todayStr) {
-
-        quotaData.tokens_today = 0;
-        quotaData.last_reset_date = todayStr;
-
-        await quotaRef.update({
-          tokens_today: 0,
-          last_reset_date: todayStr
-        });
-      }
+      await quotaRef.set({
+        tokens_today: quotaData.tokens_today,
+        daily_limit: quotaData.daily_limit,
+        live_seconds_today: quotaData.live_seconds_today,
+        live_seconds_limit: quotaData.live_seconds_limit,
+        last_reset_date: todayStr,
+      });
+    } else if (needsReset(quotaSnap.data(), todayStr)) {
+      await quotaRef.update(buildResetUpdate(todayStr));
     }
 
 

@@ -1,5 +1,8 @@
 import admin from "firebase-admin";
-import { normalizeQuota, todayString, clampBillableSeconds } from "../lib/liveQuota.js";
+import { extractBearerToken } from "../lib/auth.js";
+import { todayString } from "../lib/liveQuota.js";
+import { planUsageReport, isEmptyPlan } from "../lib/quotaStore.js";
+import { planToUpdate } from "../lib/firestorePlan.js";
 
 if (!admin.apps.length) {
   try {
@@ -20,43 +23,65 @@ const db = admin.firestore();
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ message: 'Use POST' });
 
-  const { uid, seconds } = req.body;
-  if (!uid) return res.status(400).json({ error: "Unauthorized: Missing User ID" });
+  // Verified uid only — a body uid would let anyone drain another user's bucket.
+  const idToken = extractBearerToken(req);
+  if (!idToken) {
+    return res.status(401).json({
+      error: "Unauthorized",
+      message: "Missing Authorization: Bearer <Firebase ID token>",
+    });
+  }
+
+  let uid;
+  try {
+    ({ uid } = await admin.auth().verifyIdToken(idToken));
+  } catch (error) {
+    console.error("live-usage auth error:", error.message);
+    return res.status(401).json({ error: "Unauthorized", message: "Invalid or expired ID token" });
+  }
+
+  const { seconds } = req.body;
 
   try {
     const quotaRef = db.collection("users_quota").doc(uid);
-    const quotaSnap = await quotaRef.get();
     const todayStr = todayString(new Date());
-    const quota = normalizeQuota(quotaSnap.exists ? quotaSnap.data() : null, todayStr);
-    const session = (quotaSnap.exists && quotaSnap.data().live_session) || {};
 
-    const billedSeconds = clampBillableSeconds({
-      reported: seconds,
-      mintedAtMs: session.mintedAt ?? null,
-      nowMs: Date.now(),
-      ttlSeconds: session.ttlSeconds ?? 600,
-      used: quota.live_seconds_today,
-      limit: quota.live_seconds_limit,
+    const outcome = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(quotaRef);
+      const result = planUsageReport({
+        data: snap.exists ? snap.data() : null,
+        todayStr,
+        nowMs: Date.now(),
+        reported: seconds,
+      });
+
+      if (!snap.exists) {
+        tx.set(quotaRef, planToUpdate(result.plan), { merge: true });
+      } else if (!isEmptyPlan(result.plan)) {
+        tx.update(quotaRef, planToUpdate(result.plan));
+      }
+
+      return result;
     });
 
-    await quotaRef.set({
-      tokens_today: quota.tokens_today,
-      daily_limit: quota.daily_limit,
-      live_seconds_today: quota.live_seconds_today + billedSeconds,
-      live_seconds_limit: quota.live_seconds_limit,
-      last_reset_date: quota.last_reset_date,
-      live_session: admin.firestore.FieldValue.delete(),
-    }, { merge: true });
+    // A session that bills nothing is the signature of a client bug (reporting
+    // under the wrong uid, firing before the mint). Never let it pass silently.
+    if (Number(seconds) > 0 && outcome.billedSeconds === 0) {
+      console.warn(
+        `live-usage: reported ${seconds}s but billed 0 (uid ${uid}, reason ${outcome.reason})`
+      );
+    }
 
     return res.status(200).json({
-      billedSeconds,
-      liveSecondsToday: quota.live_seconds_today + billedSeconds,
-      liveSecondsLimit: quota.live_seconds_limit,
+      billedSeconds: outcome.billedSeconds,
+      reason: outcome.reason,
+      liveSecondsToday: outcome.liveSecondsToday,
+      liveSecondsLimit: outcome.liveSecondsLimit,
     });
   } catch (error) {
     console.error("live-usage Error:", error.message);
