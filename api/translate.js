@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import admin from "firebase-admin";
+import { buildSystemInstruction } from "../lib/prompt.js";
 
 
 if (!admin.apps.length) {
@@ -28,7 +29,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ message: 'Use POST' });
 
-  const { sourceText, targets, uid } = req.body;
+  const { sourceText, targets, uid, twoWay } = req.body;
 
   if (!uid) {
     return res.status(400).json({ error: "Unauthorized: Missing User ID" });
@@ -84,7 +85,7 @@ export default async function handler(req, res) {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     const model = genAI.getGenerativeModel({
       model: "gemini-3.1-flash-lite-preview",
-      systemInstruction: "Expert Translator. Detect source language (English name). Translate by Formality(0-100) & Objective per target."
+      systemInstruction: buildSystemInstruction(twoWay)
     });
 
     const generationConfig = {
