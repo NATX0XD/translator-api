@@ -3,6 +3,7 @@ import admin from "firebase-admin";
 import { buildSystemInstruction } from "../lib/prompt.js";
 import { buildResetUpdate, needsReset, normalizeQuota, todayString } from "../lib/liveQuota.js";
 import { buildResponseSchema } from "../lib/responseSchema.js";
+import { isRetryableModelError, withRetry } from "../lib/retry.js";
 import { validateTranslateRequest } from "../lib/validation.js";
 
 
@@ -116,10 +117,14 @@ export default async function handler(req, res) {
     };
 
     const userPrompt = JSON.stringify({ src: sourceText, targets });
-    const result = await model.generateContent({
+
+    // The model is a preview one and answers 503 "experiencing high demand"
+    // during spikes. Retried here rather than left to the user, who has no way
+    // to tell an overloaded model from a broken app.
+    const result = await withRetry(() => model.generateContent({
       contents: [{ role: "user", parts: [{ text: userPrompt }] }],
       generationConfig
-    });
+    }));
 
     const responseText = result.response.text();
     const parsedResponse = JSON.parse(responseText);
@@ -143,6 +148,19 @@ export default async function handler(req, res) {
 
   } catch (error) {
     console.error("API Error:", error.message);
+
+    // A model that is merely busy is not a failure of this app, and saying so
+    // is the difference between "try again in a moment" and "something is
+    // broken". `code` is what the UI branches on; the status mirrors upstream.
+    if (isRetryableModelError(error)) {
+      return res.status(503).json({
+        error: "Model Unavailable",
+        code: "MODEL_OVERLOADED",
+        message: "The translation model is busy right now. Please try again in a moment.",
+        detail: error.message
+      });
+    }
+
     return res.status(500).json({
       error: "Translation Failed",
       message: error.message

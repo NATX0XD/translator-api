@@ -187,3 +187,51 @@ test('twoWay with the wrong target count is refused before Firestore or the mode
   assert.equal(store.touched, 0);
   assert.equal(calls.length, 0);
 });
+
+// --- upstream model overload -------------------------------------------------
+
+const overloaded = () =>
+  new Error(
+    '[GoogleGenerativeAI Error]: Error fetching from https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent: [503 Service Unavailable] This model is currently experiencing high demand.'
+  );
+
+test('a transient 503 from the model is retried instead of surfaced', async () => {
+  const store = useStore({
+    'users_quota/user-1': { tokens_today: 0, daily_limit: 10000, last_reset_date: TODAY() },
+  });
+  const calls = stubGemini({ totalTokenCount: 42, failWith: [overloaded(), overloaded()] });
+
+  const res = await run({ uid: 'user-1', sourceText: 'hello', targets: [target('Thai')] });
+
+  assert.equal(res.statusCode, 200, 'a model spike that clears on the second try is not a user-visible failure');
+  assert.equal(calls.length, 3);
+  assert.equal(store.raw('users_quota/user-1').tokens_today, 42, 'only the successful attempt is billed');
+});
+
+test('an exhausted 503 answers 503 with a code the UI can tell apart from a bug', async () => {
+  const store = useStore({
+    'users_quota/user-1': { tokens_today: 0, daily_limit: 10000, last_reset_date: TODAY() },
+  });
+  stubGemini({ failWith: [overloaded(), overloaded(), overloaded()] });
+
+  const res = await run({ uid: 'user-1', sourceText: 'hello', targets: [target('Thai')] });
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.body.code, 'MODEL_OVERLOADED');
+  assert.equal(
+    store.raw('users_quota/user-1').tokens_today,
+    0,
+    'a request the model never answered must not spend the user quota'
+  );
+});
+
+test('a permanent model error still answers 500 and is not retried', async () => {
+  useStore({ 'users_quota/user-1': { tokens_today: 0, daily_limit: 10000, last_reset_date: TODAY() } });
+  const badKey = new Error('[GoogleGenerativeAI Error]: [400 Bad Request] API key not valid');
+  const calls = stubGemini({ failWith: [badKey, badKey, badKey] });
+
+  const res = await run({ uid: 'user-1', sourceText: 'hello', targets: [target('Thai')] });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(calls.length, 1, 'retrying a bad API key is three times the latency for the same failure');
+});

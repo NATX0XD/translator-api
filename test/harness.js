@@ -13,6 +13,7 @@
  */
 import admin from 'firebase-admin';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { todayString } from '../lib/liveQuota.js';
 
 const clone = (value) => (value === null || value === undefined ? value : JSON.parse(JSON.stringify(value)));
 
@@ -210,6 +211,9 @@ export const stubGemini = ({
   detected = 'Thai',
   translations = [{ lang: 'English', text: 'Hello' }],
   totalTokenCount = 100,
+  // Errors to throw before the first success, one per call — lets a test drive
+  // the retry path without waiting on a real backoff.
+  failWith = [],
 } = {}) => {
   const calls = [];
 
@@ -217,6 +221,8 @@ export const stubGemini = ({
     return {
       generateContent: async (request) => {
         calls.push({ modelConfig, request });
+        const failure = failWith[calls.length - 1];
+        if (failure) throw failure;
         return {
           response: {
             text: () => JSON.stringify({ detected, translations }),
@@ -247,11 +253,13 @@ export const stubTokenMint = ({ ok = true, status = 200, name = 'ephemeral-token
   return calls;
 };
 
-export const dateString = (offsetDays = 0) => {
-  const date = new Date();
-  date.setUTCDate(date.getUTCDate() + offsetDays);
-  return date.toISOString().split('T')[0];
-};
+/**
+ * Must use the handlers' own day rule. When this computed a UTC date and the
+ * handlers cut the day at Bangkok midnight, every reset assertion silently
+ * inverted for the seven hours between 17:00Z and midnight Z.
+ */
+export const dateString = (offsetDays = 0) =>
+  todayString(new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000));
 
 export const TODAY = () => dateString(0);
 export const YESTERDAY = () => dateString(-1);
