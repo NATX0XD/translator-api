@@ -1,0 +1,9 @@
+# Vercel turns every file under api/ into a serverless function. Without this,
+# api/translate.test.js and friends deploy as live endpoints — burning function
+# slots and publishing test code.
+api/*.test.js
+test/
+
+# Local only.
+.env
+node_modules/
